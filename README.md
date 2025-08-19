@@ -1,2 +1,2 @@
-# Sentient-AI-game
+
 This description is vague for a reason...
