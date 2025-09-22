@@ -39,6 +39,7 @@ EMO_COLORS = {
     "angry": (255, 69, 0),
     "lonely": (160, 32, 240),
     "sad": (70, 130, 180),
+    "epic": (255, 20, 147)
 }
 
 personality_A = {
@@ -137,7 +138,6 @@ STATE_DIM = len(encode_state(
     0, 0, "neutral", "neutral",
     0, 0
 ))
-
 
 
 # --- Q net ---
@@ -591,6 +591,9 @@ def interactive_pygame(max_steps=50, epsilon=0.1):
     screen = pygame.display.set_mode((screen_width, HEIGHT))
     clock = pygame.time.Clock()
 
+    # --- Chat input state ---
+    input_text = ""   # stores current text input
+
     # --- Buttons (right column) ---
     BUTTONS = [
         {"label": "Ask Food",  "action": ACT_ASK_FOOD},
@@ -604,7 +607,6 @@ def interactive_pygame(max_steps=50, epsilon=0.1):
     def draw_buttons():
         font = pygame.font.SysFont("consolas", 18)
         rects = []
-        # Sidebar background for buttons
         button_panel = pygame.Rect(WIDTH+300, 0, 200, HEIGHT)
         pygame.draw.rect(screen, (40, 40, 40), button_panel)
 
@@ -621,22 +623,20 @@ def interactive_pygame(max_steps=50, epsilon=0.1):
             screen.blit(text, (rect.x + 10, rect.y + 10))
             rects.append((rect, btn["action"]))
         return rects
-    
 
-        # --- Transfer helper: returns (giver_new, receiver_new, moved) ---
+    # --- Helper for transfers ---
     def do_transfer(giver_amt, receiver_amt, receiver_max,
-                    min_keep_for_giver=0.0,   # reserve
-                    min_chunk=0.5,            # don't "give" dust
-                    max_chunk=2.0):           # cap per step
-        room = max(0.0, receiver_max - receiver_amt)          # receiver need
-        can_spare = max(0.0, giver_amt - min_keep_for_giver)  # giver margin
+                    min_keep_for_giver=2.0,   # reserve
+                    min_chunk=0.5,
+                    max_chunk=2.0):
+        room = max(0.0, receiver_max - receiver_amt)
+        can_spare = max(0.0, giver_amt - min_keep_for_giver)
         raw = min(room, can_spare, max_chunk)
         moved = raw if raw >= min_chunk else 0.0
         if moved > 0.0:
             giver_amt -= moved
             receiver_amt = min(receiver_max, receiver_amt + moved)
         return giver_amt, receiver_amt, moved
-
 
     # --- Reset world ---
     a_pos, b_pos = 0, WORLD_SIZE-1
@@ -646,14 +646,9 @@ def interactive_pygame(max_steps=50, epsilon=0.1):
     emo_A, emo_B = "neutral", "neutral"
     food_timer, water_timer = 0, 0
 
-    last_give = {
-        "A_FOOD": -999, "A_WATER": -999,
-        "B_FOOD": -999, "B_WATER": -999
-    }
-
     for step in range(max_steps):
         if step == max_steps - 1:
-            print("Game Over: Maximum steps reached!")
+            add_chat("SYS", "end", "neutral", "Game Over: Maximum steps reached!")
 
         # === Player input (Agent A) ===
         act_A = None
@@ -667,22 +662,48 @@ def interactive_pygame(max_steps=50, epsilon=0.1):
                        food_timer, water_timer)
 
             rects = draw_buttons()
+
+            # --- Chat input box ---
+            font = pygame.font.SysFont("consolas", 18)
+            input_box = pygame.Rect(WIDTH+20, HEIGHT-30, 300, 25)
+            pygame.draw.rect(screen, (50, 50, 50), input_box)
+            pygame.draw.rect(screen, (200, 200, 200), input_box, 2)
+            text_surf = font.render(input_text, True, (255,255,255))
+            screen.blit(text_surf, (input_box.x+5, input_box.y+3))
+
             pygame.display.flip()
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit(); sys.exit()
+
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_LEFT:  act_A = ACT_LEFT; waiting = False
                     if event.key == pygame.K_RIGHT: act_A = ACT_RIGHT; waiting = False
                     if event.key == pygame.K_UP:    act_A = ACT_INTERACT; waiting = False
-                    if event.key == pygame.K_DOWN:  act_A = None; waiting = False  # could add "rest" here
+
+                    # --- Chat typing ---
+                    elif event.key == pygame.K_RETURN:
+                        user_msg = input_text.strip().lower()
+                        if user_msg == "ask water":
+                            act_A = ACT_ASK_WATER; waiting = False
+                            gen_chat("A", "request", emo_A)
+                        elif user_msg == "ask food":
+                            act_A = ACT_ASK_FOOD; waiting = False
+                            gen_chat("A", "request", emo_A)
+                            if user_msg:
+                                add_chat("A", "talk", emo_A, input_text)
+                        input_text = ""
+                    elif event.key == pygame.K_BACKSPACE:
+                        input_text = input_text[:-1]
+                    else:
+                        input_text += event.unicode
+
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     mx, my = event.pos
                     for rect, action in rects:
                         if rect.collidepoint(mx, my):
-                            act_A = action
-                            waiting = False
+                            act_A = action; waiting = False
 
         # === Agent B decides ===
         state = encode_state(a_pos, a_e, a_h, b_pos, b_e, b_h,
@@ -690,303 +711,77 @@ def interactive_pygame(max_steps=50, epsilon=0.1):
                              trust_A, trust_B)
         act_B = choose_action(state, epsilon, qnet_B, emo_B, trust_B, personality_B)
 
-        # === Game logic ===
-        rew_A, rew_B = STEP_REWARD, STEP_REWARD
-        asked_A, asked_B = False, False
-
-        # --- Movement ---
+        # === Movement ===
         if act_A == ACT_LEFT:   a_pos = max(0, a_pos-1); a_e -= MOVE_COST
         if act_A == ACT_RIGHT:  a_pos = min(WORLD_SIZE-1, a_pos+1); a_e -= MOVE_COST
         if act_B == ACT_LEFT:   b_pos = max(0, b_pos-1); b_e -= MOVE_COST
         if act_B == ACT_RIGHT:  b_pos = min(WORLD_SIZE-1, b_pos+1); b_e -= MOVE_COST
 
-        # --- Interact (↑ key) ---
+        # === Interact with food/water ===
         if act_A == ACT_INTERACT and a_pos == FOOD_POS and food_timer == 0:
             a_e = min(MAX_ENERGY, a_e + INITIAL_REWARD)
-            rew_A += 1.0 * (1 + rep_a*0.2)
             food_timer = FOOD_RESPAWN
         if act_A == ACT_INTERACT and a_pos == WATER_POS and water_timer == 0:
             a_h = min(MAX_HYDRATION, a_h + INITIAL_REWARD)
-            rew_A += 1.0 * (1 + rep_a*0.2)
             water_timer = WATER_RESPAWN
         if act_B == ACT_INTERACT and b_pos == FOOD_POS and food_timer == 0:
             b_e = min(MAX_ENERGY, b_e + INITIAL_REWARD)
-            rew_B += 1.0 * (1 + rep_b*0.2)
             food_timer = FOOD_RESPAWN
         if act_B == ACT_INTERACT and b_pos == WATER_POS and water_timer == 0:
             b_h = min(MAX_HYDRATION, b_h + INITIAL_REWARD)
-            rew_B += 1.0 * (1 + rep_b*0.2)
             water_timer = WATER_RESPAWN
 
-        # --- Ask (buttons) ---
+        # === Social actions (ask/give) ===
         adjacent = abs(a_pos - b_pos) <= 1
+        asked_A = (act_A in [ACT_ASK_FOOD, ACT_ASK_WATER]) and adjacent
+        asked_B = (act_B in [ACT_ASK_FOOD, ACT_ASK_WATER]) and adjacent
 
-        did_A_give = False
-        did_B_give = False
-        a_asked_now = (act_A in [ACT_ASK_FOOD, ACT_ASK_WATER]) and adjacent
-        b_asked_now = (act_B in [ACT_ASK_FOOD, ACT_ASK_WATER]) and adjacent
+        if asked_A: gen_chat("A", "request", emo_A); trust_B += 0.5
+        if asked_B: gen_chat("B", "request", emo_B); trust_A += 0.5
 
-        if a_asked_now:
-            asked_A = True; rew_A += 0.2; trust_B += 0.5
-            gen_chat("A", "request", emo_A)
-        if b_asked_now:
-            asked_B = True; rew_B += 0.2; trust_A += 0.5
-            gen_chat("B", "request", emo_B)
+        did_A_give, did_B_give = False, False
 
-        # helpers
-        def clamp_transfer(need, giver_amount, reserve, tmin, tmax):
-            # only transfer what's needed, never below reserve, within [tmin, tmax]
-            max_allowed = max(0.0, giver_amount - reserve)
-            amt = min(need, max_allowed, tmax)
-            return max(0.0, amt if amt >= tmin else 0.0)
-
-        step_idx = step  # for cooldown
-
-        # --- A gives FOOD ---
+        # A gives
         if act_A == ACT_GIVE_FOOD and adjacent:
-            # gating: require ask or clear need unless disabled
-            receiver_need = max(0.0, MAX_ENERGY - b_e)
-            can_give = (not REQUIRE_ASK_TO_GIVE and receiver_need >= NEED_THRESHOLD_ENERGY) or asked_B
-            cd_ok = (step_idx - last_give["A_FOOD"] >= GIVE_COOLDOWN_STEPS)
-            if can_give and cd_ok:
-                transfer = clamp_transfer(receiver_need, a_e, RESERVE_ENERGY,
-                                          GIVE_MIN_TRANSFER, GIVE_MAX_TRANSFER)
-                if transfer > 0:
-                    a_e -= transfer; b_e = min(MAX_ENERGY, b_e + transfer)
-                    rep_a += 1.0; rep_b += 0.3
-                    rew_A += 1.0 + rep_a*0.2; rew_B += 0.5; trust_A += 0.5
-                    gen_chat("A", "offer", emo_A)
-                    add_chat("SYS", "info", "neutral",
-                             f"A→B FOOD {transfer:.1f} (A_E {a_e:.1f} → B_E {b_e:.1f})")
-                    did_A_give = True; last_give["A_FOOD"] = step_idx
-                else:
-                    gen_chat("A", "refuse", emo_A)
-                    add_chat("SYS", "warn", "neutral", "A kept FOOD reserve; no transfer.")
-            else:
-                gen_chat("A", "refuse", emo_A)
-                add_chat("SYS", "warn", "neutral", "A didn’t meet ask/need/cooldown for FOOD.")
+            a_e, b_e, moved = do_transfer(a_e, b_e, MAX_ENERGY)
+            if moved > 0: gen_chat("A", "offer", emo_A); did_A_give = True
+            if random.random() < 0.1 and moved > 0:
+                gen_chat("SYS", "You gave agent B...", "epic")
+                gen_chat("SYS", "a novelty banana!", "epic")
+                gen_chat("B", "What have we here?", "happy")
+                trust_B += 1000000000000000000000000000000000000000000000000000000000000.0
+                gen_chat("SYS", f"Trust to B is now {trust_B}", "epic")
 
-        # --- A gives WATER ---
         if act_A == ACT_GIVE_WATER and adjacent:
-            receiver_need = max(0.0, MAX_HYDRATION - b_h)
-            can_give = (not REQUIRE_ASK_TO_GIVE and receiver_need >= NEED_THRESHOLD_HYDRATION) or asked_B
-            cd_ok = (step_idx - last_give["A_WATER"] >= GIVE_COOLDOWN_STEPS)
-            if can_give and cd_ok:
-                transfer = clamp_transfer(receiver_need, a_h, RESERVE_HYDRATION,
-                                          GIVE_MIN_TRANSFER, GIVE_MAX_TRANSFER)
-                if transfer > 0:
-                    a_h -= transfer; b_h = min(MAX_HYDRATION, b_h + transfer)
-                    rep_a += 1.0; rep_b += 0.3
-                    rew_A += 1.0 + rep_a*0.2; rew_B += 0.5; trust_A += 0.5
-                    gen_chat("A", "offer", emo_A)
-                    add_chat("SYS", "info", "neutral",
-                             f"A→B WATER {transfer:.1f} (A_H {a_h:.1f} → B_H {b_h:.1f})")
-                    did_A_give = True; last_give["A_WATER"] = step_idx
-                else:
-                    gen_chat("A", "refuse", emo_A)
-                    add_chat("SYS", "warn", "neutral", "A kept WATER reserve; no transfer.")
-            else:
-                gen_chat("A", "refuse", emo_A)
-                add_chat("SYS", "warn", "neutral", "A didn’t meet ask/need/cooldown for WATER.")
+            a_h, b_h, moved = do_transfer(a_h, b_h, MAX_HYDRATION)
+            if moved > 0: gen_chat("A", "offer", emo_A); did_A_give = True
 
-        # snub penalty if B asked and A didn’t give
-        if asked_B and adjacent and not did_A_give and act_A not in [ACT_GIVE_FOOD, ACT_GIVE_WATER]:
-            rep_a -= 0.5; rew_A -= 0.5; trust_A -= 1
-            gen_chat("A", "refuse", emo_A)
-            add_chat("SYS", "info", "neutral", "A ignored B’s request this step.")
-
-        # --- B gives FOOD ---
+        # B gives
         if act_B == ACT_GIVE_FOOD and adjacent:
-            receiver_need = max(0.0, MAX_ENERGY - a_e)
-            can_give = (not REQUIRE_ASK_TO_GIVE and receiver_need >= NEED_THRESHOLD_ENERGY) or asked_A
-            cd_ok = (step_idx - last_give["B_FOOD"] >= GIVE_COOLDOWN_STEPS)
-            if can_give and cd_ok:
-                transfer = clamp_transfer(receiver_need, b_e, RESERVE_ENERGY,
-                                          GIVE_MIN_TRANSFER, GIVE_MAX_TRANSFER)
-                if transfer > 0:
-                    b_e -= transfer; a_e = min(MAX_ENERGY, a_e + transfer)
-                    rep_b += 1.0; rep_a += 0.3
-                    rew_B += 1.0 + rep_b*0.2; rew_A += 0.5; trust_B += 0.5
-                    gen_chat("B", "offer", emo_B)
-                    add_chat("SYS", "info", "neutral",
-                             f"B→A FOOD {transfer:.1f} (B_E {b_e:.1f} → A_E {a_e:.1f})")
-                    did_B_give = True; last_give["B_FOOD"] = step_idx
-                else:
-                    gen_chat("B", "refuse", emo_B)
-                    add_chat("SYS", "warn", "neutral", "B kept FOOD reserve; no transfer.")
-            else:
-                gen_chat("B", "refuse", emo_B)
-                add_chat("SYS", "warn", "neutral", "B didn’t meet ask/need/cooldown for FOOD.")
-
-        # --- B gives WATER ---
+            b_e, a_e, moved = do_transfer(b_e, a_e, MAX_ENERGY)
+            if moved > 0: gen_chat("B", "offer", emo_B); did_B_give = True
         if act_B == ACT_GIVE_WATER and adjacent:
-            receiver_need = max(0.0, MAX_HYDRATION - a_h)
-            can_give = (not REQUIRE_ASK_TO_GIVE and receiver_need >= NEED_THRESHOLD_HYDRATION) or asked_A
-            cd_ok = (step_idx - last_give["B_WATER"] >= GIVE_COOLDOWN_STEPS)
-            if can_give and cd_ok:
-                transfer = clamp_transfer(receiver_need, b_h, RESERVE_HYDRATION,
-                                          GIVE_MIN_TRANSFER, GIVE_MAX_TRANSFER)
-                if transfer > 0:
-                    b_h -= transfer; a_h = min(MAX_HYDRATION, a_h + transfer)
-                    rep_b += 1.0; rep_a += 0.3
-                    rew_B += 1.0 + rep_b*0.2; rew_A += 0.5; trust_B += 0.5
-                    gen_chat("B", "offer", emo_B)
-                    add_chat("SYS", "info", "neutral",
-                             f"B→A WATER {transfer:.1f} (B_H {b_h:.1f} → A_H {a_h:.1f})")
-                    did_B_give = True; last_give["B_WATER"] = step_idx
-                else:
-                    gen_chat("B", "refuse", emo_B)
-                    add_chat("SYS", "warn", "neutral", "B kept WATER reserve; no transfer.")
-            else:
-                gen_chat("B", "refuse", emo_B)
-                add_chat("SYS", "warn", "neutral", "B didn’t meet ask/need/cooldown for WATER.")
+            b_h, a_h, moved = do_transfer(b_h, a_h, MAX_HYDRATION)
+            if moved > 0: gen_chat("B", "offer", emo_B); did_B_give = True
 
-        # snub penalty if A asked and B didn’t give
-        if asked_A and adjacent and not did_B_give and act_B not in [ACT_GIVE_FOOD, ACT_GIVE_WATER]:
-            rep_b -= 0.5; rew_B -= 0.5; trust_B -= 1
-            gen_chat("B", "refuse", emo_B)
-            add_chat("SYS", "info", "neutral", "B ignored A’s request this step.")
+        # Penalties if asks ignored
+        if asked_B and not did_A_give: gen_chat("A", "refuse", emo_A)
+        if asked_A and not did_B_give: gen_chat("B", "refuse", emo_B)
 
+        # === Emotions update ===
+        emo_A = update_emotion(emo_A, a_e, a_h, a_pos, b_pos,
+                               "helped" if did_A_give else
+                               "ignored" if asked_B and not did_A_give else "none")
+        emo_B = update_emotion(emo_B, b_e, b_h, b_pos, a_pos,
+                               "helped" if did_B_give else
+                               "ignored" if asked_A and not did_B_give else "none")
 
-        # --- Ask (button actions) ---
-        adjacent = abs(a_pos - b_pos) <= 1
-        did_A_give = False
-        did_B_give = False
+        # === Metabolism ===
+        a_e = max(0, a_e - 0.05); b_e = max(0, b_e - 0.05)
+        a_h = max(0, a_h - THIRST_DRAIN); b_h = max(0, b_h - THIRST_DRAIN)
+        food_timer = max(0, food_timer-1); water_timer = max(0, water_timer-1)
 
-        if act_A in [ACT_ASK_FOOD, ACT_ASK_WATER] and adjacent:
-            asked_A = True; rew_A += 0.2; trust_B += 0.5
-            gen_chat("A", "request", emo_A)
-        if act_B in [ACT_ASK_FOOD, ACT_ASK_WATER] and adjacent:
-            asked_B = True; rew_B += 0.2; trust_A += 0.5
-            gen_chat("B", "request", emo_B)
-
-        # Early visibility if not adjacent
-        if (act_A in [ACT_GIVE_FOOD, ACT_GIVE_WATER] or
-            act_B in [ACT_GIVE_FOOD, ACT_GIVE_WATER]) and not adjacent:
-            add_chat("SYS", "warn", "neutral", "Give failed: not adjacent.")
-
-        # --- A gives FOOD ---
-        if act_A == ACT_GIVE_FOOD and adjacent:
-            old_a, old_b = a_e, b_e
-            a_e, b_e, moved = do_transfer(
-                a_e, b_e, MAX_ENERGY,
-                min_keep_for_giver=2.0,  # RESERVE_ENERGY
-                min_chunk=0.5,
-                max_chunk=2.0
-            )
-            if moved > 0:
-                rep_a += 1.0; rep_b += 0.3
-                rew_A += 1.0 + rep_a*0.2; rew_B += 0.5; trust_A += 0.5
-                gen_chat("A", "offer", emo_A)
-                add_chat("SYS", "info", "neutral",
-                         f"A→B FOOD {moved:.1f} (A_E {old_a:.1f}→{a_e:.1f}, B_E {old_b:.1f}→{b_e:.1f})")
-                did_A_give = True
-            else:
-                gen_chat("A", "refuse", emo_A)
-                add_chat("SYS", "warn", "neutral",
-                         f"A kept reserve or B full (A_E={old_a:.1f}, B_E={old_b:.1f}).")
-
-        # --- A gives WATER ---
-        if act_A == ACT_GIVE_WATER and adjacent:
-            old_a, old_b = a_h, b_h
-            a_h, b_h, moved = do_transfer(
-                a_h, b_h, MAX_HYDRATION,
-                min_keep_for_giver=2.0,  # RESERVE_HYDRATION
-                min_chunk=0.5,
-                max_chunk=2.0
-            )
-            if moved > 0:
-                rep_a += 1.0; rep_b += 0.3
-                rew_A += 1.0 + rep_a*0.2; rew_B += 0.5; trust_A += 0.5
-                gen_chat("A", "offer", emo_A)
-                add_chat("SYS", "info", "neutral",
-                         f"A→B WATER {moved:.1f} (A_H {old_a:.1f}→{a_h:.1f}, B_H {old_b:.1f}→{b_h:.1f})")
-                did_A_give = True
-            else:
-                gen_chat("A", "refuse", emo_A)
-                add_chat("SYS", "warn", "neutral",
-                         f"A kept reserve or B full (A_H={old_a:.1f}, B_H={old_b:.1f}).")
-
-        # Penalty if B asked but A didn’t give
-        if asked_B and adjacent and not did_A_give and act_A not in [ACT_GIVE_FOOD, ACT_GIVE_WATER]:
-            rep_a -= 0.5; rew_A -= 0.5; trust_A -= 1
-            gen_chat("A", "refuse", emo_A)
-            add_chat("SYS", "info", "neutral", "A ignored B’s request this step.")
-
-        # --- B gives FOOD ---
-        if act_B == ACT_GIVE_FOOD and adjacent:
-            old_b, old_a = b_e, a_e
-            b_e, a_e, moved = do_transfer(
-                b_e, a_e, MAX_ENERGY,
-                min_keep_for_giver=2.0,
-                min_chunk=0.5,
-                max_chunk=2.0
-            )
-            if moved > 0:
-                rep_b += 1.0; rep_a += 0.3
-                rew_B += 1.0 + rep_b*0.2; rew_A += 0.5; trust_B += 0.5
-                gen_chat("B", "offer", emo_B)
-                add_chat("SYS", "info", "neutral",
-                         f"B→A FOOD {moved:.1f} (B_E {old_b:.1f}→{b_e:.1f}, A_E {old_a:.1f}→{a_e:.1f})")
-                did_B_give = True
-            else:
-                gen_chat("B", "refuse", emo_B)
-                add_chat("SYS", "warn", "neutral",
-                         f"B kept reserve or A full (B_E={old_b:.1f}, A_E={old_a:.1f}).")
-
-        # --- B gives WATER ---
-        if act_B == ACT_GIVE_WATER and adjacent:
-            old_b, old_a = b_h, a_h
-            b_h, a_h, moved = do_transfer(
-                b_h, a_h, MAX_HYDRATION,
-                min_keep_for_giver=2.0,
-                min_chunk=0.5,
-                max_chunk=2.0
-            )
-            if moved > 0:
-                rep_b += 1.0; rep_a += 0.3
-                rew_B += 1.0 + rep_b*0.2; rew_A += 0.5; trust_B += 0.5
-                gen_chat("B", "offer", emo_B)
-                add_chat("SYS", "info", "neutral",
-                         f"B→A WATER {moved:.1f} (B_H {old_b:.1f}→{b_h:.1f}, A_H {old_a:.1f}→{a_h:.1f})")
-                did_B_give = True
-            else:
-                gen_chat("B", "refuse", emo_B)
-                add_chat("SYS", "warn", "neutral",
-                         f"B kept reserve or A full (B_H={old_b:.1f}, A_H={old_a:.1f}).")
-
-        # Penalty if A asked but B didn’t give
-        if asked_A and adjacent and not did_B_give and act_B not in [ACT_GIVE_FOOD, ACT_GIVE_WATER]:
-            rep_b -= 0.5; rew_B -= 0.5; trust_B -= 1
-            gen_chat("B", "refuse", emo_B)
-            add_chat("SYS", "info", "neutral", "B ignored A’s request this step.")
-
-
-        # --- Emotions ---
-        emo_A = update_emotion(
-            emo_A, a_e, a_h, a_pos, b_pos,
-            "helped" if act_A in [ACT_GIVE_FOOD, ACT_GIVE_WATER] else
-            "ignored" if (act_B in [ACT_ASK_FOOD, ACT_ASK_WATER] and act_A not in [ACT_GIVE_FOOD, ACT_GIVE_WATER]) else "none"
-        )
-        emo_B = update_emotion(
-            emo_B, b_e, b_h, b_pos, a_pos,
-            "helped" if act_B in [ACT_GIVE_FOOD, ACT_GIVE_WATER] else
-            "ignored" if (act_A in [ACT_ASK_FOOD, ACT_ASK_WATER] and act_B not in [ACT_GIVE_FOOD, ACT_GIVE_WATER]) else "none"
-        )
-        rew_A += emotion_bonus(emo_A)
-        rew_B += emotion_bonus(emo_B)
-
-        # --- Metabolism ---
-        a_e = max(0, a_e - 0.05)
-        b_e = max(0, b_e - 0.05)
-        a_h = max(0, a_h - THIRST_DRAIN)
-        b_h = max(0, b_h - THIRST_DRAIN)
-
-        rep_a *= 0.995; rep_b *= 0.995
-        food_timer = max(0, food_timer-1)
-        water_timer = max(0, water_timer-1)
-
-        # Redraw after actions
+        # === Draw frame ===
         draw_world(screen, a_pos, b_pos,
                    a_e, a_h, b_e, b_h,
                    emo_A, emo_B,
@@ -998,14 +793,13 @@ def interactive_pygame(max_steps=50, epsilon=0.1):
         pygame.display.flip()
 
         if a_e <= 0 or a_h <= 0 or b_e <= 0 or b_h <= 0:
-            add_chat("SYS", "Game Over: one agent collapsed.")
+            add_chat("SYS", "end", "neutral", "Game Over: one agent collapsed.")
             break
 
         clock.tick(30)
-
-
 
 # === Entry Point ===
 if __name__ == "__main__":
     run_training(episodes=700)
     interactive_pygame(max_steps=30, epsilon=0.1)
+
